@@ -1,0 +1,793 @@
+# -*- coding: utf-8 -*- 
+
+""" 
+
+Catálogo y registros de EMOCIONES (SQLite) 
+
+- Si ejecutas SIN argumentos: modo rápido interactivo (te pregunta en terminal). 
+
+- También puedes usar: menu | emo-add | emo-list | emo-del | reg-add | reg-list | reg-stats 
+
+""" 
+
+ 
+
+from __future__ import annotations 
+
+import sqlite3, argparse, csv, datetime as dt 
+
+from pathlib import Path 
+
+from typing import Optional, Iterable, Tuple 
+
+ 
+
+DB_NAME = "emociones.db" 
+
+ 
+
+# ----- Esquema ----- 
+
+SQL_CREATE = [ 
+
+    """ 
+
+    CREATE TABLE IF NOT EXISTS emociones( 
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+
+        nombre TEXT NOT NULL UNIQUE, 
+
+        activo INTEGER NOT NULL DEFAULT 1 
+
+    ); 
+
+    """, 
+
+    """ 
+
+    CREATE TABLE IF NOT EXISTS registro_emocional( 
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+
+        adulto_id TEXT NOT NULL, 
+
+        fecha TEXT NOT NULL, 
+
+        turno TEXT NOT NULL CHECK(turno IN ('M','T')), 
+
+        emocion_id INTEGER NOT NULL REFERENCES emociones(id), 
+
+        estado TEXT NOT NULL CHECK(estado IN ('R','O','D')), 
+
+        comentario TEXT DEFAULT '', 
+
+        created_at TEXT NOT NULL DEFAULT (datetime('now')) 
+
+    ); 
+
+    """, 
+
+    """ 
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_registro_emocional 
+
+      ON registro_emocional(adulto_id, fecha, turno); 
+
+    """ 
+
+] 
+
+ 
+
+SQL_INSERT_EMO = "INSERT INTO emociones(nombre, activo) VALUES(?, 1);" 
+
+SQL_LIST_EMO = """SELECT id, nombre, activo FROM emociones 
+
+                  {where} 
+
+                  ORDER BY nombre COLLATE NOCASE;""" 
+
+SQL_DELETE_EMO = "DELETE FROM emociones WHERE id = ?;" 
+
+SQL_GET_EMO_BY_NAME = "SELECT id FROM emociones WHERE lower(nombre)=lower(?) AND activo=1;" 
+
+SQL_GET_EMO_BY_ID   = "SELECT id FROM emociones WHERE id=? AND activo=1;" 
+
+ 
+
+SQL_INSERT_REG = """ 
+
+INSERT INTO registro_emocional(adulto_id, fecha, turno, emocion_id, estado, comentario) 
+
+VALUES(?,?,?,?,?,?); 
+
+""" 
+
+ 
+
+SQL_LIST_REG = """ 
+
+SELECT r.id, r.adulto_id, r.fecha, r.turno, 
+
+       e.nombre AS emocion, r.estado, r.comentario 
+
+FROM registro_emocional r 
+
+JOIN emociones e ON e.id = r.emocion_id 
+
+{where} 
+
+ORDER BY r.fecha DESC, r.turno DESC, r.id DESC; 
+
+""" 
+
+ 
+
+SQL_STATS = """ 
+
+SELECT e.nombre, COUNT(*) AS n 
+
+FROM registro_emocional r 
+
+JOIN emociones e ON e.id = r.emocion_id 
+
+{where} 
+
+GROUP BY e.nombre 
+
+ORDER BY n DESC, e.nombre; 
+
+""" 
+
+ 
+
+def connect(db: Optional[Path] = None) -> sqlite3.Connection: 
+
+    return sqlite3.connect(str(db or Path.cwd()/DB_NAME)) 
+
+ 
+
+def init_db(conn: sqlite3.Connection) -> None: 
+
+    for stmt in SQL_CREATE: 
+
+        conn.execute(stmt) 
+
+    conn.commit() 
+
+ 
+
+# ------ Catálogo ------ 
+
+def emo_add(conn: sqlite3.Connection, nombre: str) -> int: 
+
+    with conn: 
+
+        cur = conn.execute(SQL_INSERT_EMO, (nombre.strip(),)) 
+
+        return cur.lastrowid 
+
+ 
+
+def emo_list(conn: sqlite3.Connection, like: Optional[str]) -> Iterable[Tuple]: 
+
+    where, params = "", () 
+
+    if like: 
+
+        where, params = "WHERE nombre LIKE ?", (f"%{like}%",) 
+
+    cur = conn.execute(SQL_LIST_EMO.format(where=where), params) 
+
+    return cur.fetchall() 
+
+ 
+
+def emo_del(conn: sqlite3.Connection, emo_id: int) -> int: 
+
+    with conn: 
+
+        cur = conn.execute(SQL_DELETE_EMO, (emo_id,)) 
+
+        return cur.rowcount 
+
+ 
+
+# ------ Registros ------ 
+
+def _resolve_emocion_id(conn: sqlite3.Connection, emocion: Optional[str], emocion_id: Optional[int]) -> int: 
+
+    if emocion_id: 
+
+        row = conn.execute(SQL_GET_EMO_BY_ID, (emocion_id,)).fetchone() 
+
+        if not row: 
+
+            raise ValueError(f"No existe emoción con id={emocion_id} (o inactiva).") 
+
+        return emocion_id 
+
+    if not emocion: 
+
+        raise ValueError("Indica el nombre de la emoción o un id.") 
+
+    row = conn.execute(SQL_GET_EMO_BY_NAME, (emocion.strip(),)).fetchone() 
+
+    if row: 
+
+        return row[0] 
+
+    return emo_add(conn, emocion.strip()) 
+
+ 
+
+def _iso_date(s: Optional[str]) -> str: 
+
+    return (s or dt.date.today().isoformat()) 
+
+ 
+
+def reg_add(conn: sqlite3.Connection, adulto: str, turno: str, emocion: Optional[str], 
+
+            emocion_id: Optional[int], estado: str, fecha: Optional[str], coment: str) -> int: 
+
+    turno = turno.upper() 
+
+    estado = estado.upper() 
+
+    if turno not in ("M","T"): 
+
+        raise ValueError("turno debe ser M o T.") 
+
+    if estado not in ("R","O","D"): 
+
+        raise ValueError("estado debe ser R/O/D.") 
+
+    emo_id = _resolve_emocion_id(conn, emocion, emocion_id) 
+
+    with conn: 
+
+        cur = conn.execute(SQL_INSERT_REG, (adulto.strip(), _iso_date(fecha), turno, emo_id, estado, coment.strip())) 
+
+        return cur.lastrowid 
+
+ 
+
+def reg_list(conn: sqlite3.Connection, adulto: Optional[str], desde: Optional[str], 
+
+             hasta: Optional[str], turno: Optional[str]): 
+
+    clauses, params = [], [] 
+
+    if adulto: 
+
+        clauses.append("r.adulto_id = ?"); params.append(adulto.strip()) 
+
+    if desde: 
+
+        clauses.append("r.fecha >= ?");   params.append(desde) 
+
+    if hasta: 
+
+        clauses.append("r.fecha <= ?");   params.append(hasta) 
+
+    if turno: 
+
+        clauses.append("r.turno = ?");    params.append(turno.upper()) 
+
+    where = "WHERE " + " AND ".join(clauses) if clauses else "" 
+
+    cur = conn.execute(SQL_LIST_REG.format(where=where), params) 
+
+    return cur.fetchall() 
+
+ 
+
+def reg_stats(conn: sqlite3.Connection, adulto: Optional[str]): 
+
+    where, params = "", [] 
+
+    if adulto: 
+
+        where, params = "WHERE r.adulto_id = ?", [adulto.strip()] 
+
+    cur = conn.execute(SQL_STATS.format(where=where), params) 
+
+    return cur.fetchall() 
+
+ 
+
+# ------ Exports ------ 
+
+def export_emo_csv(conn: sqlite3.Connection, out: Path) -> Path: 
+
+    rows = emo_list(conn, None) 
+
+    with out.open("w", encoding="utf-8", newline="") as f: 
+
+        w = csv.writer(f) 
+
+        w.writerow(["id","nombre","activo"]) 
+
+        for r in rows: 
+
+            w.writerow(r) 
+
+    return out 
+
+ 
+
+def export_reg_csv(conn: sqlite3.Connection, out: Path, adulto: Optional[str]=None) -> Path: 
+
+    rows = reg_list(conn, adulto, None, None, None) 
+
+    with out.open("w", encoding="utf-8", newline="") as f: 
+
+        w = csv.writer(f) 
+
+        w.writerow(["id","adulto_id","fecha","turno","emocion","estado","comentario"]) 
+
+        for r in rows: 
+
+            w.writerow(r) 
+
+    return out 
+
+ 
+
+# ------ UI consola ------ 
+
+def _press_enter(): 
+
+    input("\n(Enter para continuar) ") 
+
+ 
+
+def _print_emociones(conn): 
+
+    rows = emo_list(conn, None) 
+
+    if not rows: 
+
+        print("Catálogo vacío.") 
+
+        return 
+
+    print(f"{'ID':>3}  {'Emoción':<20} {'Activo':<6}") 
+
+    print("-"*36) 
+
+    for _id, nombre, activo in rows: 
+
+        print(f"{_id:>3}  {nombre:<20.20} {('sí' if activo else 'no'):>6}") 
+
+ 
+
+def _print_registros(conn, adulto=None): 
+
+    rows = reg_list(conn, adulto, None, None, None) 
+
+    if not rows: 
+
+        print("No hay registros.") 
+
+        return 
+
+    print(f"{'ID':>3} {'Adulto':<10} {'Fecha':<10} {'Trn':<3} {'Emoción':<12} {'Est':<3}  Comentario") 
+
+    print("-"*80) 
+
+    for _id, adulto, fecha, turno, emo, est, cmt in rows: 
+
+        print(f"{_id:>3} {adulto:<10.10} {fecha:<10} {turno:<3} {emo:<12.12} {est:<3}  {cmt}") 
+
+ 
+
+def run_menu(conn): 
+
+    init_db(conn) 
+
+    while True: 
+
+        print("\n=== Registro de Emociones (menu) ===") 
+
+        print("1) Listar emociones") 
+
+        print("2) Agregar emoción") 
+
+        print("3) Registrar estado (R/O/D)") 
+
+        print("4) Listar registros") 
+
+        print("5) Estadísticas por emoción") 
+
+        print("6) Exportar CSV (emociones / registros)") 
+
+        print("0) Salir") 
+
+        op = input("Opción: ").strip() 
+
+        try: 
+
+            if op == "1": 
+
+                _print_emociones(conn); _press_enter() 
+
+            elif op == "2": 
+
+                nombre = input("Nombre de la emoción: ").strip() 
+
+                if not nombre: print("Nombre vacío."); continue 
+
+                try: 
+
+                    eid = emo_add(conn, nombre) 
+
+                    print(f"✅ Emoción creada id={eid}") 
+
+                except sqlite3.IntegrityError: 
+
+                    print("⚠️  Ya existe esa emoción.") 
+
+                _press_enter() 
+
+            elif op == "3": 
+
+                adulto = input("Adulto: ").strip() 
+
+                turno = input("Turno (M/T): ").strip().upper() 
+
+                if turno not in ("M","T"): 
+
+                    print("Turno inválido."); continue 
+
+                emo_in = input("Emoción: ").strip() 
+
+                emo_id = int(emo_in) if emo_in.isdigit() else None 
+
+                emo_nom = None if emo_id else emo_in 
+
+                estado = input("Estado (R=Realizado, O=Omitido, D=Diferido): ").strip().upper() 
+
+                if estado not in ("R","O","D"): 
+
+                    print("Estado inválido."); continue 
+
+                fecha = input("Fecha (YYYY-MM-DD, vacío = hoy): ").strip() or None 
+
+                coment = input("Comentario (opcional): ").strip() 
+
+                try: 
+
+                    rid = reg_add(conn, adulto, turno, emo_nom, emo_id, estado, fecha, coment) 
+
+                    print(f"✅ Registro creado id={rid}") 
+
+                except sqlite3.IntegrityError: 
+
+                    print("⚠️  Ya existe un registro para ese adulto en esa fecha/turno.") 
+
+                except ValueError as e: 
+
+                    print(f"⚠️  {e}") 
+
+                _press_enter() 
+
+            elif op == "4": 
+
+                adulto = input("Filtrar por Adulto (vacío = todos): ").strip() or None 
+
+                _print_registros(conn, adulto); _press_enter() 
+
+            elif op == "5": 
+
+                adulto = input("Filtrar por Adulto (vacío = todos): ").strip() or None 
+
+                rows = reg_stats(conn, adulto) 
+
+                if not rows: 
+
+                    print("Sin datos.") 
+
+                else: 
+
+                    print(f"{'Emoción':<15} {'#':>4}") 
+
+                    print("-"*22) 
+
+                    for emo, n in rows: 
+
+                        print(f"{emo:<15.15} {n:>4}") 
+
+                _press_enter() 
+
+            elif op == "6": 
+
+                cual = input("¿Exportar (E)emociones o (R)registros? ").strip().upper() 
+
+                if cual == "E": 
+
+                    out = Path(input("Archivo (por defecto Emociones.csv): ").strip() or "Emociones.csv") 
+
+                    export_emo_csv(conn, out); print(f"✅ CSV: {out.resolve()}") 
+
+                elif cual == "R": 
+
+                    out = Path(input("Archivo (por defecto RegistrosEmociones.csv): ").strip() or "RegistrosEmociones.csv") 
+
+                    adulto = input("Filtrar por Adulto (vacío = todos): ").strip() or None 
+
+                    export_reg_csv(conn, out, adulto); print(f"✅ CSV: {out.resolve()}") 
+
+                else: 
+
+                    print("Opción inválida.") 
+
+                _press_enter() 
+
+            elif op == "0": 
+
+                print("Hasta luego."); break 
+
+            else: 
+
+                print("Opción inválida.") 
+
+        except Exception as e: 
+
+            print(f"⚠️  Error: {e}") 
+
+            _press_enter() 
+
+ 
+
+# --- MODO RÁPIDO (se ejecuta por defecto sin argumentos) --- 
+
+def run_quick(conn): 
+
+    init_db(conn) 
+
+    print("\n=== Captura rápida de emoción y registro ===") 
+
+    # (1) opcional: crear emoción 
+
+    nombre = input("Nueva emoción (deja vacío si no quieres crear): ").strip() 
+
+    if nombre: 
+
+        try: 
+
+            eid = emo_add(conn, nombre) 
+
+            print(f"✅ Emoción creada id={eid}") 
+
+        except sqlite3.IntegrityError: 
+
+            print("⚠️  Ya existía; se usará la existente si la ocupas.") 
+
+    # (2) registrar estado 
+
+    adulto = input("Adulto: ").strip() 
+
+    turno = input("Turno (M/T): ").strip().upper() 
+
+    emo_in = input("Emoción: ").strip() 
+
+    emo_id = int(emo_in) if emo_in.isdigit() else None 
+
+    emo_nom = None if emo_id else emo_in 
+
+    estado = input("Estado (R/O/D): ").strip().upper() 
+
+    fecha = input("Fecha (YYYY-MM-DD, vacío = hoy): ").strip() or None 
+
+    coment = input("Comentario (opcional): ").strip() 
+
+    try: 
+
+        rid = reg_add(conn, adulto, turno, emo_nom, emo_id, estado, fecha, coment) 
+
+        print(f"✅ Registro creado id={rid}") 
+
+    except sqlite3.IntegrityError: 
+
+        print("⚠️  Ya existe un registro para ese adulto en esa fecha y turno.") 
+
+    except ValueError as e: 
+
+        print(f"⚠️  {e}") 
+
+ 
+
+# ------ CLI ------ 
+
+def build_parser() -> argparse.ArgumentParser: 
+
+    p = argparse.ArgumentParser(description="Catálogo y registros de emociones (SQLite)") 
+
+    p.add_argument("--db", type=Path, default=Path.cwd()/DB_NAME, help="ruta del .db (opcional)") 
+
+    sub = p.add_subparsers(dest="cmd") 
+
+ 
+
+    sub.add_parser("init-db", help="crear tablas si no existen") 
+
+    sub.add_parser("menu", help="modo interactivo") 
+
+ 
+
+    sp = sub.add_parser("emo-add", help="agregar emoción"); sp.add_argument("--nombre", required=True) 
+
+    sp = sub.add_parser("emo-list", help="listar catálogo");  sp.add_argument("--like", default="") 
+
+    sp = sub.add_parser("emo-del", help="eliminar emoción"); sp.add_argument("--id", type=int, required=True) 
+
+ 
+
+    sp = sub.add_parser("reg-add", help="crear registro (M/T, R/O/D)") 
+
+    sp.add_argument("--adulto", required=True); sp.add_argument("--turno", required=True, choices=["M","T"]) 
+
+    g = sp.add_mutually_exclusive_group(required=True); g.add_argument("--emocion"); g.add_argument("--emocion-id", type=int) 
+
+    sp.add_argument("--estado", required=True, choices=["R","O","D"]); sp.add_argument("--fecha"); sp.add_argument("--coment", default="") 
+
+ 
+
+    sp = sub.add_parser("reg-list", help="listar registros") 
+
+    sp.add_argument("--adulto"); sp.add_argument("--desde"); sp.add_argument("--hasta"); sp.add_argument("--turno", choices=["M","T"]) 
+
+ 
+
+    sp = sub.add_parser("reg-stats", help="conteos por emoción"); sp.add_argument("--adulto") 
+
+ 
+
+    sp = sub.add_parser("export-emo-csv", help="exportar catálogo");      sp.add_argument("--out", type=Path, default=Path("Emociones.csv")) 
+
+    sp = sub.add_parser("export-reg-csv", help="exportar registros");     sp.add_argument("--out", type=Path, default=Path("RegistrosEmociones.csv")); sp.add_argument("--adulto") 
+
+ 
+
+    return p 
+
+ 
+
+def main(argv: list[str] | None = None) -> int: 
+
+    args = build_parser().parse_args(argv) 
+
+    conn = connect(args.db) 
+
+ 
+
+    # Si NO pones argumentos, entra a modo rápido 
+
+    if args.cmd is None: 
+
+        run_quick(conn) 
+
+        return 0 
+
+ 
+
+    if args.cmd == "menu": 
+
+        run_menu(conn); return 0 
+
+ 
+
+    if args.cmd == "init-db": 
+
+        init_db(conn); print(f"✅ Tablas listas en: {args.db.resolve()}"); return 0 
+
+ 
+
+    if args.cmd == "emo-add": 
+
+        init_db(conn) 
+
+        try: print(f"✅ Emoción id={emo_add(conn, args.nombre)}: {args.nombre}") 
+
+        except sqlite3.IntegrityError: print("⚠️  Ya existe esa emoción.") 
+
+        return 0 
+
+ 
+
+    if args.cmd == "emo-list": 
+
+        init_db(conn) 
+
+        rows = emo_list(conn, getattr(args, "like", "") or None) 
+
+        if not rows: 
+
+            print("Catálogo vacío.") 
+
+            return 0 
+
+        print(f"{'ID':>3}  {'Emoción':<20} {'Activo':<6}") 
+
+        print("-"*36) 
+
+        for _id, nombre, activo in rows: 
+
+            print(f"{_id:>3}  {nombre:<20.20} {('sí' if activo else 'no'):>6}") 
+
+        return 0 
+
+ 
+
+    if args.cmd == "emo-del": 
+
+        init_db(conn); print("✅ Eliminada." if emo_del(conn, args.id) else "⚠️  No existe ese id."); return 0 
+
+ 
+
+    if args.cmd == "reg-add": 
+
+        init_db(conn) 
+
+        try: 
+
+            rid = reg_add(conn, args.adulto, args.turno, args.emocion, args.emocion_id, args.estado, args.fecha, args.coment) 
+
+            print(f"✅ Registro creado id={rid}.") 
+
+        except sqlite3.IntegrityError: 
+
+            print("⚠️  Ya existe un registro para ese adulto en esa fecha y turno.") 
+
+        except ValueError as e: 
+
+            print(f"⚠️  {e}") 
+
+        return 0 
+
+ 
+
+    if args.cmd == "reg-list": 
+
+        init_db(conn); _print_registros(conn, args.adulto); return 0 
+
+ 
+
+    if args.cmd == "reg-stats": 
+
+        init_db(conn) 
+
+        rows = reg_stats(conn, args.adulto) 
+
+        if not rows: print("Sin datos."); return 0 
+
+        print(f"{'Emoción':<15} {'#':>4}"); print("-"*22) 
+
+        for emo, n in rows: print(f"{emo:<15.15} {n:>4}") 
+
+        return 0 
+
+ 
+
+    if args.cmd == "export-emo-csv": 
+
+        init_db(conn); out = export_emo_csv(conn, args.out); print(f"✅ CSV: {out.resolve()}"); return 0 
+
+ 
+
+    if args.cmd == "export-reg-csv": 
+
+        init_db(conn); out = export_reg_csv(conn, args.out, args.adulto); print(f"✅ CSV: {out.resolve()}"); return 0 
+
+ 
+
+    return 0 
+
+ 
+
+if __name__ == "__main__": 
+
+    raise SystemExit(main()) 
